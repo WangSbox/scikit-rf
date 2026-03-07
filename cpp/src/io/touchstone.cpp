@@ -1,4 +1,4 @@
-#include "../include/skrf_cpp/touchstone.h"
+#include "../include/skrf_cpp/io/touchstone.h"
 #include "../include/skrf_cpp/util.h"
 #include "../include/skrf_cpp/mathFunctions.h"
 #include <fstream>
@@ -10,7 +10,7 @@
 
 namespace skrf_cpp {
 
-Network Touchstone::load(const std::string &path) {
+Network Touchstone::load(const std::string &path, bool lenient, std::vector<std::string> *warnings) {
     std::ifstream ifs(path);
     if(!ifs) throw std::runtime_error("cannot open file: " + path);
 
@@ -19,34 +19,59 @@ Network Touchstone::load(const std::string &path) {
     bool header_parsed = false;
 
     TouchstoneOptions opts;
-    // scan for option line starting with '#'
-    while(std::getline(ifs, line)) {
+    // read logical lines (support continuation with '\\' and inline '!' comments)
+    int phys_line_no = 0;
+    auto read_logical = [&](std::ifstream &ifs_in, std::string &out_line) -> bool {
+        out_line.clear();
+        std::string phy;
+        bool any = false;
+        while(std::getline(ifs_in, phy)) {
+            ++phys_line_no;
+            any = true;
+            // strip inline comment marker '!'
+            auto pc = phy.find('!');
+            if(pc != std::string::npos) phy = phy.substr(0, pc);
+            // trim right
+            while(!phy.empty() && (phy.back()=='\r' || phy.back()=='\n' || phy.back()==' ' || phy.back()=='\t')) phy.pop_back();
+            bool cont = false;
+            if(!phy.empty() && phy.back() == '\\') { cont = true; phy.pop_back(); }
+            if(out_line.empty()) out_line = phy; else out_line += " "; out_line += phy;
+            if(!cont) break;
+        }
+        return any && !out_line.empty();
+    };
+
+    // first pass: parse header options
+    ifs.clear(); ifs.seekg(0);
+    while(read_logical(ifs, line)) {
         std::string t = trim(line);
         if(t.empty()) continue;
-        if(t[0] == '!') continue;
         if(t[0] == '#') {
             std::string rest = t.substr(1);
             opts = parse_touchstone_options(rest);
             net.z0 = opts.z0;
             break;
         }
-        if(t[0] != '!') break;
     }
     TouchstoneOptions::DataFormat format = opts.format;
     double freq_multiplier = opts.freq_multiplier;
 
-    ifs.clear();
-    ifs.seekg(0);
+    // second pass: deduce port count and collect numeric rows using logical lines
+    ifs.clear(); ifs.seekg(0);
+    // reset phys_line_no for second pass
+    phys_line_no = 0;
+    while(read_logical(ifs, line)) {
+        std::string t = trim(line);
+        if(t.empty()) continue;
+        if(t[0] == '#' ) continue;
+        // skip comment-only lines
+        if(t[0] == '!') continue;
 
-    // deduce port count from first numeric line
-    while(std::getline(ifs, line)) {
-        line = trim(line);
-        if(line.empty()) continue;
-        if(line[0] == '!' || line[0] == '#') continue;
-
-        std::istringstream iss(line);
-        std::vector<double> vals;
-        double v;
+        // remove inline comments again and parse numbers
+        auto posc = line.find('!');
+        std::string dataline = (posc==std::string::npos) ? line : line.substr(0,posc);
+        std::istringstream iss(dataline);
+        std::vector<double> vals; double v;
         while(iss >> v) vals.push_back(v);
         if(vals.empty()) continue;
 
@@ -54,32 +79,38 @@ Network Touchstone::load(const std::string &path) {
         if(numD <= 0) continue;
         int nParamPairs = numD/2;
         int n_ports = static_cast<int>(std::round(std::sqrt((double)nParamPairs)));
-        if(n_ports*n_ports != nParamPairs) {
-            throw std::runtime_error("unsupported touchstone data layout (non-square S matrix)");
-        }
+        if(n_ports * n_ports != nParamPairs) continue; // look for a proper numeric line
 
         net.n_ports = n_ports;
 
-        // parse all numeric lines
-        ifs.clear();
-        ifs.seekg(0);
-        while(std::getline(ifs, line)) {
-            line = trim(line);
-            if(line.empty()) continue;
-            if(line[0] == '!' || line[0] == '#') continue;
-
-            std::istringstream iss2(line);
-            std::vector<double> row;
-            double w;
+        // now collect numeric rows from start using logical reader
+        ifs.clear(); ifs.seekg(0);
+        while(read_logical(ifs, line)) {
+            std::string tl = trim(line);
+            if(tl.empty()) continue;
+            if(tl[0] == '#') continue;
+            auto pc = tl.find('!'); if(pc != std::string::npos) tl = tl.substr(0, pc);
+            std::istringstream iss2(tl);
+            std::vector<double> row; double w;
             while(iss2 >> w) row.push_back(w);
             if(row.empty()) continue;
 
             double freq = row[0] * freq_multiplier;
+            if(!net.freqs.empty() && std::abs(net.freqs.back().hz - freq) < 1e-12) continue;
             net.freqs.emplace_back(freq);
 
             int expected = 1 + 2 * n_ports * n_ports;
             if(static_cast<int>(row.size()) < expected) {
-                throw std::runtime_error("insufficient columns in touchstone data line");
+                if(lenient && warnings) {
+                    std::ostringstream ss; ss << "skipping malformed row (expected " << expected << " cols) at freq " << row[0] << " (approx file line " << phys_line_no << ")";
+                    warnings->push_back(ss.str());
+                    continue;
+                } else if(lenient) {
+                    continue;
+                } else {
+                    std::ostringstream ss; ss << "insufficient columns in touchstone data line at approx file line " << phys_line_no;
+                    throw std::runtime_error(ss.str());
+                }
             }
 
             std::vector<std::complex<double>> srow(n_ports*n_ports);
@@ -89,18 +120,12 @@ Network Touchstone::load(const std::string &path) {
                 double b = row[idx++];
                 std::complex<double> val;
                 if(format == DataFormat::MA) {
-                    double mag = a;
-                    double phase_deg = b;
-                    double phase = phase_deg * M_PI / 180.0;
+                    double mag = a; double phase_deg = b; double phase = phase_deg * M_PI / 180.0;
                     val = std::complex<double>(mag * std::cos(phase), mag * std::sin(phase));
                 } else if(format == DataFormat::DB) {
-                    double mag = std::pow(10.0, a/20.0);
-                    double phase_deg = b;
-                    double phase = phase_deg * M_PI / 180.0;
+                    double mag = std::pow(10.0, a/20.0); double phase_deg = b; double phase = phase_deg * M_PI / 180.0;
                     val = std::complex<double>(mag * std::cos(phase), mag * std::sin(phase));
-                } else { // RI
-                    val = std::complex<double>(a, b);
-                }
+                } else { val = std::complex<double>(a, b); }
                 srow[i] = val;
             }
             net.sparams.push_back(std::move(srow));
@@ -110,7 +135,11 @@ Network Touchstone::load(const std::string &path) {
         break;
     }
 
-    if(!header_parsed) throw std::runtime_error("no data parsed from touchstone file");
+    if(!header_parsed) {
+        if(lenient && warnings) warnings->push_back(std::string("no data parsed from touchstone file: ") + path);
+        if(lenient) return net;
+        throw std::runtime_error(std::string("no data parsed from touchstone file: ") + path);
+    }
     return net;
 }
 

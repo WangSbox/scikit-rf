@@ -18,4 +18,18 @@ inline void complex_to_mag_phase(const std::complex<double>& z, double &mag, dou
     phase_deg = std::arg(z) * 180.0 / M_PI;
 }
 
+// Unwrap phase vector (degrees)
+inline std::vector<double> unwrap_phase(const std::vector<double> &phase_deg) {
+    if(phase_deg.empty()) return {};
+    std::vector<double> out = phase_deg;
+    double offset = 0.0;
+    for(size_t i=1;i<out.size();++i) {
+        double dp = out[i] - out[i-1];
+        if(dp > 180.0) offset -= 360.0;
+        else if(dp < -180.0) offset += 360.0;
+        out[i] += offset;
+    }
+    return out;
+}
+
 }

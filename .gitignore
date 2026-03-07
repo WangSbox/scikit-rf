@@ -25,3 +25,4 @@ lint.xml
 .venv/
 test-results/*.xml
 testing.xlsx
+cpp/Third_Party/*

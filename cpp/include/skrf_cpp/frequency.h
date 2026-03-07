@@ -13,6 +13,18 @@ public:
 
     size_t size() const { return hz.size(); }
     double operator[](size_t i) const { return hz[i]; }
+    // find index of exact match within tol, else return npos
+    size_t index_of(double f, double tol = 1e-9) const {
+        for(size_t i=0;i<hz.size();++i) if(std::abs(hz[i] - f) <= tol) return i;
+        return static_cast<size_t>(-1);
+    }
+    // return index of closest frequency
+    size_t closest_index(double f) const {
+        if(hz.empty()) return static_cast<size_t>(-1);
+        size_t best = 0; double bestd = std::abs(hz[0]-f);
+        for(size_t i=1;i<hz.size();++i) { double d = std::abs(hz[i]-f); if(d < bestd) { bestd = d; best = i; } }
+        return best;
+    }
 };
 
 }

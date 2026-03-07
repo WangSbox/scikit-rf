@@ -7,7 +7,7 @@
 #include <Eigen/Dense>
 #include "network.h"
 #include "frequency.h"
-#include "../mathFunctions.h"
+#include "mathFunctions.h"
 #include <algorithm>
 #include "transforms.h"
 
@@ -86,7 +86,7 @@ public:
 
     // convert S to ABCD for 2-port networks (Z0 scalar). For n_ports != 2 throws.
     NetworkEigen to_abcd(double z0_scalar = 50.0) const {
-        if(n_ports != 2) throw std::runtime_error("to_abcd implemented only for 2-port networks");
+        if(n_ports != 2) throw std::runtime_error("to_abcd implemented only for 2-port networks; for n-port consider extracting a 2-port subnetwork or implementing a custom conversion");
         NetworkEigen out;
         out.n_ports = n_ports;
         out.freqs = freqs;
@@ -129,7 +129,7 @@ public:
     // Cascade this 2-port network with another (this followed by other).
     // Both networks must have same frequency points and be 2-port.
     NetworkEigen cascade_with(const NetworkEigen &other, double z0_scalar = 50.0) const {
-        if(n_ports != 2 || other.n_ports != 2) throw std::runtime_error("cascade_with supports only 2-port networks");
+        if(n_ports != 2 || other.n_ports != 2) throw std::runtime_error("cascade_with supports only 2-port networks; for n-port workflows use merge_block_diag/connect_and_merge_indices or extract_ports to create 2-port chains");
         if(freqs.size() != other.freqs.size()) throw std::runtime_error("frequency point mismatch for cascade");
         NetworkEigen out;
         out.n_ports = 2;
@@ -156,7 +156,7 @@ public:
         // all must be 2-port and same freq size
         size_t nfreq = list.front().freqs.size();
         for(const auto &n : list) {
-            if(n.n_ports != 2) throw std::runtime_error("cascade_list supports only 2-port networks");
+            if(n.n_ports != 2) throw std::runtime_error("cascade_list supports only 2-port networks; provide only 2-port elements or pre-extract 2-port chains");
             if(n.freqs.size() != nfreq) throw std::runtime_error("frequency point mismatch in cascade_list");
         }
         NetworkEigen out;
