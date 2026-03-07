@@ -10,6 +10,7 @@
 #include "mathFunctions.h"
 #include <algorithm>
 #include "transforms.h"
+#include "network_set.h"
 
 namespace skrf_cpp {
 
@@ -21,6 +22,10 @@ public:
     double z0{50.0};
     std::vector<Frequency> freqs;
     std::vector<MatrixXcd> s_params; // per-frequency S matrix
+    // optional per-frequency reference impedances (if present)
+    std::vector<double> per_freq_z0;
+    // optional per-frequency gamma/comments parsed from Touchstone (best-effort)
+    std::vector<std::complex<double>> per_freq_gamma;
 
     NetworkEigen() = default;
 
@@ -109,6 +114,8 @@ public:
         Network out;
         out.n_ports = n_ports;
         out.z0 = z0;
+        out.per_freq_z0 = per_freq_z0;
+        out.per_freq_gamma = per_freq_gamma;
         out.freqs = freqs;
         out.sparams.clear();
         out.sparams.reserve(s_params.size());
@@ -176,6 +183,28 @@ public:
             M(0,0)=Stot(0,0); M(0,1)=Stot(0,1); M(1,0)=Stot(1,0); M(1,1)=Stot(1,1);
             out.s_params.push_back(M);
         }
+        return out;
+    }
+
+    // Helper: cascade an ordered list of arbitrary n-port networks by
+    // performing a block-diagonal merge then applying port connections.
+    // `adjacent_pairs` describes connections between successive elements:
+    // adjacent_pairs[k] contains pairs (port_in_k, port_in_k+1) that should
+    // be connected. This function converts each NetworkEigen to flat Network,
+    // uses NetworkSet helpers to merge/connect, and returns the resulting
+    // merged NetworkEigen.
+    static NetworkEigen cascade_nport_with_connections(const std::vector<NetworkEigen> &list,
+                                                       const std::vector<std::vector<std::pair<int,int>>> &adjacent_pairs) {
+        if(list.empty()) return NetworkEigen();
+        // convert to flat Networks
+        std::vector<Network> flats;
+        for(const auto &ne : list) flats.push_back(ne.to_flat_network());
+        // prepare indices
+        std::vector<size_t> indices(flats.size());
+        for(size_t i=0;i<indices.size();++i) indices[i]=i;
+        NetworkSet ns(flats);
+        Network merged = ns.cascade_with_connections(indices, adjacent_pairs);
+        NetworkEigen out = merged.to_network_eigen();
         return out;
     }
 

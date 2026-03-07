@@ -16,6 +16,10 @@ public:
     int n_ports{0};
     double z0{50.0};
     std::vector<Frequency> freqs;
+    // optional per-frequency reference impedances (if present in source, e.g., HFSS per-frequency port impedance)
+    std::vector<double> per_freq_z0;
+    // optional per-frequency gamma/comments parsed from Touchstone (best-effort)
+    std::vector<std::complex<double>> per_freq_gamma;
     // For each frequency, a flat vector of size n_ports*n_ports (row-major)
     std::vector<std::vector<std::complex<double>>> sparams;
 
@@ -143,6 +147,8 @@ private:
         NetworkEigen out;
         out.n_ports = n_ports;
         out.z0 = z0;
+        out.per_freq_z0 = per_freq_z0;
+        out.per_freq_gamma = per_freq_gamma;
         out.freqs = freqs;
         out.s_params.clear();
         out.s_params.reserve(sparams.size());

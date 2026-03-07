@@ -1,3 +1,13 @@
+<!--
+ * @Author: WangSibo, wsb304617488@gmail.com
+ * @Date: 2026-03-06 21:52:15
+ * @LastEditors: WangSibo
+ * @LastEditTime: 2026-03-07 17:52:08
+ * @FilePath: \scikit-rf\skrf 从 Python 转到 C++14 _README.md
+ * @Description: Copyright (c) 2026 by wsb304617488@gmail.com, All Rights Reserved.
+ * it's ok, everything will be ok.
+ * Copyright (c) 2026 by wsb304617488@gmail.com, All Rights Reserved. 
+-->
 # skrf 从 Python 转到 C++14 — README
 
 ## 项目简介
@@ -56,50 +66,6 @@ cpp/
 ├─ docs/                   # Doxygen 配置与扩展文档
 └─ examples/
    └─ read_touchstone_example.cpp
-```
-
-## API 设计要点（从 Python → C++ 的映射建议）
-
-* `Frequency`（Python：`skrf.frequency.Frequency`）
-
-  * C++：`skrf::Frequency` 类，持有 `std::vector<double>`（Hz）。提供插值辅助与边界/索引操作。
-* `Network`（Python：`skrf.network.Network`）
-
-  * C++：`skrf::Network`，持有 `size_t ports`、`Frequency freq` 与 `std::vector<Eigen::MatrixXcd> s_params`。
-  * 方法：`s_at_index(size_t)`, `s_interp(double freq_hz)`, `to_z()`, `to_y()`, `to_abcd()` 等。
-* Touchstone I/O
-
-  * C++：`skrf::io::Touchstone` 类或 free functions：`read_touchstone(path)` 返回 `Network`；`write_touchstone(path, Network)` 写出。
-  * 支持格式：RI / MA / DB 与常见频率单位（Hz/kHz/MHz/GHz）。
-* 变换与网络算子
-
-  * 提供 `s_to_z`, `z_to_s`, `s_to_abcd`, `abcd_to_s` 等函数（使用 `Eigen::Matrix2cd` / `Eigen::MatrixXcd` 作为矩阵类型）。
-* 例子/兼容层（暂不实现）
-
-  * 提供用于与 Python 版结果对比的序列化（例如 CSV 或二进制测试向量），便于自动化回归测试。
-
-## 精度与数值注意事项
-
-* 默认使用 `double` 与 `std::complex<double>`，并用 `Eigen::MatrixXcd` 存储复矩阵。
-* 矩阵运算（行列数可变）采用 `Eigen` 优化路径；对 2×2 常用转换可以专门实现高效版本以避免动态分配。
-* 插值：建议至少支持线性插值（简单可靠），并提供可选的 cubic spline（可用 `Boost.Math` 或自实现的自然样条）。
-
-## 构建与示例（本地）
-
-1. 安装依赖
-
-2. 构建：
-
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -- -j$(nproc)
-```
-
-3. 运行示例：
-
-```bash
-./examples/read_touchstone_example path/to/file.s2p
 ```
 
 ## 单元测试与回归测试（暂不实现）

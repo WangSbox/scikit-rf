@@ -60,6 +60,9 @@ Network Touchstone::load(const std::string &path, bool lenient, std::vector<std:
     ifs.clear(); ifs.seekg(0);
     // reset phys_line_no for second pass
     phys_line_no = 0;
+    // collect HFSS special comment blocks if present
+    std::vector<std::vector<double>> hfss_gamma_vals;
+    std::vector<std::vector<double>> hfss_impedance_vals;
     while(read_logical(ifs, line)) {
         std::string t = trim(line);
         if(t.empty()) continue;
@@ -67,8 +70,16 @@ Network Touchstone::load(const std::string &path, bool lenient, std::vector<std:
         // skip comment-only lines
         if(t[0] == '!') continue;
 
+        // handle bracketed v2-style sections minimally: record and skip
+        if(!t.empty() && t.front() == '[') {
+            // basic support: allow files with [Version] / [Network Data] sections
+            // we don't fully implement v2 parsing here but accept and continue
+            continue;
+        }
+
         // remove inline comments again and parse numbers
         auto posc = line.find('!');
+        std::string commentpart = (posc==std::string::npos) ? std::string() : line.substr(posc);
         std::string dataline = (posc==std::string::npos) ? line : line.substr(0,posc);
         std::istringstream iss(dataline);
         std::vector<double> vals; double v;
@@ -89,7 +100,26 @@ Network Touchstone::load(const std::string &path, bool lenient, std::vector<std:
             std::string tl = trim(line);
             if(tl.empty()) continue;
             if(tl[0] == '#') continue;
-            auto pc = tl.find('!'); if(pc != std::string::npos) tl = tl.substr(0, pc);
+            // capture HFSS per-frequency comments like '! gamma' or '! port impedance'
+            auto pc = tl.find('!');
+            std::string comment = (pc != std::string::npos) ? tl.substr(pc) : std::string();
+            if(!comment.empty()) {
+                std::string low = comment;
+                for(auto &c : low) c = static_cast<char>(std::tolower((unsigned char)c));
+                if(low.rfind("! gamma", 0) == 0) {
+                    // parse following numbers in comment part
+                    std::istringstream issc(comment.substr(6)); double vv; std::vector<double> rowv;
+                    while(issc >> vv) rowv.push_back(vv);
+                    if(!rowv.empty()) hfss_gamma_vals.push_back(std::move(rowv));
+                } else if(low.find("! port impedance") != std::string::npos) {
+                    // parse following numbers
+                    std::size_t pos = low.find("! port impedance");
+                    std::istringstream issc(comment.substr(pos + std::string("! port impedance").size())); double vv; std::vector<double> rowv;
+                    while(issc >> vv) rowv.push_back(vv);
+                    if(!rowv.empty()) hfss_impedance_vals.push_back(std::move(rowv));
+                }
+            }
+            if(pc != std::string::npos) tl = tl.substr(0, pc);
             std::istringstream iss2(tl);
             std::vector<double> row; double w;
             while(iss2 >> w) row.push_back(w);
@@ -139,6 +169,37 @@ Network Touchstone::load(const std::string &path, bool lenient, std::vector<std:
         if(lenient && warnings) warnings->push_back(std::string("no data parsed from touchstone file: ") + path);
         if(lenient) return net;
         throw std::runtime_error(std::string("no data parsed from touchstone file: ") + path);
+    }
+    // If HFSS impedance comments were present, set net.z0 to first parsed value (best-effort)
+    if(!hfss_impedance_vals.empty()) {
+        const auto &v = hfss_impedance_vals.front();
+        if(!v.empty()) {
+            // take first numeric as reference resistance (real part)
+            net.z0 = v.front();
+            if(warnings) {
+                std::ostringstream ss; ss << "parsed HFSS port impedance block: setting network z0 to " << net.z0;
+                warnings->push_back(ss.str());
+            }
+        }
+    }
+    // If parsed per-frequency impedance/gamma blocks align with frequency count, attach them to network
+    if(!hfss_impedance_vals.empty() && hfss_impedance_vals.size() == net.freqs.size()) {
+        net.per_freq_z0.clear(); net.per_freq_z0.reserve(net.freqs.size());
+        for(size_t i=0;i<net.freqs.size();++i) {
+            const auto &row = hfss_impedance_vals[i];
+            if(!row.empty()) net.per_freq_z0.push_back(row.front()); else net.per_freq_z0.push_back(net.z0);
+        }
+        if(warnings) warnings->push_back(std::string("filled per-frequency impedance vector from HFSS comments"));
+    }
+    if(!hfss_gamma_vals.empty() && hfss_gamma_vals.size() == net.freqs.size()) {
+        net.per_freq_gamma.clear(); net.per_freq_gamma.reserve(net.freqs.size());
+        for(size_t i=0;i<net.freqs.size();++i) {
+            const auto &row = hfss_gamma_vals[i];
+            if(row.size() >= 2) net.per_freq_gamma.emplace_back(row[0], row[1]);
+            else if(row.size() == 1) net.per_freq_gamma.emplace_back(row[0], 0.0);
+            else net.per_freq_gamma.emplace_back(0.0, 0.0);
+        }
+        if(warnings) warnings->push_back(std::string("filled per-frequency gamma vector from HFSS comments"));
     }
     return net;
 }

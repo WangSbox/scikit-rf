@@ -259,49 +259,155 @@ public:
         out.freqs = ref.freqs;
         out.sparams.resize(nfreq);
         for(size_t fi=0; fi<nfreq; ++fi) {
-            std::vector<std::complex<double>> vals(ntwk_set.size()*nports*nports);
-            for(size_t ni=0; ni<ntwk_set.size(); ++ni) {
-                const auto &flat = ntwk_set[ni].sparams[fi];
-                for(size_t k=0;k<flat.size();++k) vals[ni*flat.size()+k] = flat[k];
-            }
-            // for each component, interpolate simple linear between nearest
+            // gather per-network flat arrays for this frequency
+            std::vector<std::vector<std::complex<double>>> comps(ntwk_set.size());
+            for(size_t ni=0; ni<ntwk_set.size(); ++ni) comps[ni] = ntwk_set[ni].sparams[fi];
+
             std::vector<std::complex<double>> outflat(nports*nports);
+
+            // helper: compute natural cubic spline second derivatives for real-valued y
+            auto compute_m2 = [&](const std::vector<double> &xs, const std::vector<double> &ys)->std::vector<double> {
+                size_t n = xs.size();
+                std::vector<double> m2(n, 0.0);
+                if(n < 3) return m2; // trivial
+                std::vector<double> u(n-1, 0.0);
+                std::vector<double> diag(n, 0.0), off(n-1, 0.0), rhs(n, 0.0);
+                // natural spline: second derivative at endpoints = 0
+                // build tridiagonal system
+                for(size_t i=1;i<n-1;++i) {
+                    double h_i = xs[i] - xs[i-1];
+                    double h_ip1 = xs[i+1] - xs[i];
+                    diag[i] = (h_i + h_ip1) / 3.0;
+                    off[i-1] = h_i / 6.0;
+                    rhs[i] = (ys[i+1] - ys[i]) / h_ip1 - (ys[i] - ys[i-1]) / h_i;
+                }
+                // forward elimination
+                for(size_t i=1;i<n-2;++i) {
+                    double m = off[i-1] / diag[i];
+                    diag[i+1] -= m * off[i-1];
+                    rhs[i+1] -= m * rhs[i];
+                }
+                // back substitution
+                if(n>=3) {
+                    // solve for interior points 1..n-2
+                    std::vector<double> interior(n-2,0.0);
+                    if(n-2>0) {
+                        // Thomas algorithm on tri-diagonal of size n-2
+                        std::vector<double> a(n-2,0.0), b(n-2,0.0), c(n-2,0.0), d(n-2,0.0);
+                        for(size_t i=0;i<n-2;++i) {
+                            b[i] = diag[i+1];
+                            d[i] = rhs[i+1];
+                            if(i>0) a[i] = off[i-1];
+                            if(i < n-3) c[i] = off[i];
+                        }
+                        // solve tridiagonal
+                        // forward
+                        for(size_t i=1;i<n-2;++i) {
+                            double w = a[i] / b[i-1];
+                            b[i] -= w * c[i-1];
+                            d[i] -= w * d[i-1];
+                        }
+                        // back
+                        interior[n-3] = d[n-3] / b[n-3];
+                        for(int i=(int)n-4;i>=0;--i) interior[i] = (d[i] - c[i] * interior[i+1]) / b[i];
+                    }
+                    for(size_t i=1;i<n-1;++i) m2[i] = interior[i-1];
+                }
+                return m2;
+            };
+
+            // for each matrix element, build sample vectors and interpolate
             for(size_t k=0;k<nports*nports;++k) {
-                // build vector of samples
-                std::vector<std::pair<double,std::complex<double>>> samples;
-                for(size_t ni=0; ni<ntwk_set.size(); ++ni) samples.emplace_back(ntw_param[ni], vals[ni*(nports*nports)+k]);
-                // find segment
-                size_t idx = 1;
-                while(idx < samples.size() && samples[idx].first < x) ++idx;
-                if(idx==0) outflat[k] = samples.front().second;
-                else if(idx>=samples.size()) outflat[k] = samples.back().second;
-                else {
-                    double x0 = samples[idx-1].first; double x1 = samples[idx].first;
-                    double t = (x - x0) / (x1 - x0);
-                    outflat[k] = samples[idx-1].second * (1.0 - t) + samples[idx].second * t;
+                std::vector<double> xs(ntw_param.begin(), ntw_param.end());
+                std::vector<std::complex<double>> ys; ys.reserve(ntwk_set.size());
+                for(size_t ni=0; ni<ntwk_set.size(); ++ni) ys.push_back(comps[ni][k]);
+
+                if(interp_kind == "linear") {
+                    // linear interpolation (keep previous simple approach)
+                    std::vector<std::pair<double,std::complex<double>>> samples;
+                    for(size_t ni=0; ni<ntwk_set.size(); ++ni) samples.emplace_back(ntw_param[ni], ys[ni]);
+                    size_t idx = 1; while(idx < samples.size() && samples[idx].first < x) ++idx;
+                    if(idx==0) outflat[k] = samples.front().second;
+                    else if(idx>=samples.size()) outflat[k] = samples.back().second;
+                    else {
+                        double x0 = samples[idx-1].first; double x1 = samples[idx].first;
+                        double t = (x - x0) / (x1 - x0);
+                        outflat[k] = samples[idx-1].second * (1.0 - t) + samples[idx].second * t;
+                    }
+                } else if(interp_kind == "cubic") {
+                    // natural cubic spline on real and imag separately
+                    // sort samples by xs
+                    std::vector<size_t> order(xs.size()); std::iota(order.begin(), order.end(), 0);
+                    std::sort(order.begin(), order.end(), [&](size_t a, size_t b){ return xs[a] < xs[b]; });
+                    std::vector<double> xs_s(xs.size()); std::vector<double> yr(xs.size()), yi(xs.size());
+                    for(size_t ii=0; ii<xs.size(); ++ii) { xs_s[ii] = xs[order[ii]]; yr[ii] = ys[order[ii]].real(); yi[ii] = ys[order[ii]].imag(); }
+
+                    // handle degenerate cases
+                    if(xs_s.size() == 1) { outflat[k] = std::complex<double>(yr[0], yi[0]); continue; }
+                    if(xs_s.size() == 2) {
+                        double x0 = xs_s[0], x1 = xs_s[1]; double t = (x - x0) / (x1 - x0);
+                        outflat[k] = std::complex<double>(yr[0] * (1-t) + yr[1] * t, yi[0] * (1-t) + yi[1] * t);
+                        continue;
+                    }
+
+                    auto m2r = compute_m2(xs_s, yr);
+                    auto m2i = compute_m2(xs_s, yi);
+
+                    // find segment
+                    size_t idx = 1; while(idx < xs_s.size() && xs_s[idx] < x) ++idx;
+                    if(idx==0) idx = 1; if(idx >= xs_s.size()) idx = xs_s.size()-1;
+                    size_t i0 = idx-1, i1 = idx;
+                    double h = xs_s[i1] - xs_s[i0]; if(h == 0) { outflat[k] = std::complex<double>(yr[i0], yi[i0]); continue; }
+                    double a = (xs_s[i1] - x) / h; double b = (x - xs_s[i0]) / h;
+                    double yr_val = a * yr[i0] + b * yr[i1] + ((a*a*a - a) * m2r[i0] + (b*b*b - b) * m2r[i1]) * (h*h) / 6.0;
+                    double yi_val = a * yi[i0] + b * yi[i1] + ((a*a*a - a) * m2i[i0] + (b*b*b - b) * m2i[i1]) * (h*h) / 6.0;
+                    outflat[k] = std::complex<double>(yr_val, yi_val);
+                } else {
+                    throw std::runtime_error(std::string("interpolate_from_network: unsupported interp_kind '") + interp_kind + "'");
                 }
             }
+
             out.sparams[fi] = std::move(outflat);
         }
         return out;
     }
 
-    // Interpolate based on named params not implemented in this C++ port
-    Network interpolate_from_params(const std::string &param, double x, const std::map<std::string, double> &sub_params = {}) const {
-        // Implementation: look up networks that have the named parameter and
-        // perform a linear interpolation across that parameter using
-        // `interpolate_from_network` helper. If no networks contain the
-        // parameter, raise with guidance.
+    // Interpolate based on a single named parameter.
+    // Behavior aligned with Python: explicitly check parameter names across
+    // stored `params`, support interpolation kinds ('linear','cubic'), and
+    // by default reject out-of-bounds x (throw). Set `allow_extrapolate=true`
+    // to permit clamping/extrapolation behavior.
+    Network interpolate_from_params(const std::string &param,
+                                    double x,
+                                    const std::map<std::string, double> &sub_params = {},
+                                    const std::string &interp_kind = "linear",
+                                    bool allow_extrapolate = false) const {
         if(ntwk_set.empty()) return Network();
-        // collect samples where param exists
+
+        // collect available parameter names
+        bool found_param = false;
+        for(size_t i=0;i<params.size() && i<ntwk_set.size(); ++i) {
+            if(params[i].find(param) != params[i].end()) { found_param = true; break; }
+        }
+        if(!found_param) {
+            throw std::runtime_error(std::string("interpolate_from_params: parameter '") + param + " is not present in any stored network params; provide params when constructing NetworkSet.");
+        }
+
+        // collect samples where param exists (and apply sub_params filters)
         std::vector<double> samples_val;
         std::vector<size_t> samples_idx;
         for(size_t i=0;i<params.size() && i<ntwk_set.size(); ++i) {
+            bool ok = true;
+            for(const auto &kv : sub_params) {
+                auto itf = params[i].find(kv.first);
+                if(itf == params[i].end() || itf->second != kv.second) { ok = false; break; }
+            }
+            if(!ok) continue;
             auto it = params[i].find(param);
             if(it != params[i].end()) { samples_val.push_back(it->second); samples_idx.push_back(i); }
         }
         if(samples_idx.empty()) {
-            throw std::runtime_error(std::string("interpolate_from_params: parameter '") + param + "' not found in any stored network params; provide params when constructing NetworkSet or use interpolate_from_network.");
+            throw std::runtime_error(std::string("interpolate_from_params: parameter '") + param + " not found in any stored network params after applying sub_params filters");
         }
 
         // build ntw_param vector and subset networks
@@ -313,16 +419,19 @@ public:
             subset.push_back(ntwk_set[samples_idx[k]]);
         }
 
-        // If the provided x is outside sample range, clamp to min/max (linear extrapolation not supported)
+        // check bounds
         double xmin = *std::min_element(ntw_param.begin(), ntw_param.end());
         double xmax = *std::max_element(ntw_param.begin(), ntw_param.end());
-        double xclamped = x;
-        if(x < xmin) xclamped = xmin;
-        if(x > xmax) xclamped = xmax;
+        if(!allow_extrapolate && (x < xmin || x > xmax)) {
+            std::ostringstream ss; ss << "interpolate_from_params: requested x=" << x << " outside sample range [" << xmin << "," << xmax << "]";
+            throw std::runtime_error(ss.str());
+        }
 
-        // use existing interpolate_from_network by delegating to a temporary NetworkSet
+        // delegate to interpolate_from_network which supports interp_kind
         NetworkSet tmp(subset);
-        return tmp.interpolate_from_network(ntw_param, xclamped, "linear");
+        double x_use = x;
+        if(!allow_extrapolate) { if(x_use < xmin) x_use = xmin; if(x_use > xmax) x_use = xmax; }
+        return tmp.interpolate_from_network(ntw_param, x_use, interp_kind);
     }
 
     // Multi-parameter interpolation (separable, iterative along params order).
