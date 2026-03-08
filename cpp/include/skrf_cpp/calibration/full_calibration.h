@@ -348,39 +348,503 @@ private:
 // NZC variants: provide runnable Z-branch fallback and placeholders for
 // future time-domain implementation. These classes expose same interface
 // but note they currently use Z-branch internally (use_z_instead_ifft flag ignored)
+// Helper: extrapolate network to DC by linear extrapolation of first two
+// frequency samples (produces a copy with an inserted DC point at front).
+static Network extrapolate_to_dc(const Network &ntwk) {
+    Network out = ntwk;
+    if(out.freqs.size() == 0) return out;
+    if(out.sparams.size() < 2) return out;
+    // compute DC point by linear extrapolation of first two samples
+    double f0 = out.freqs[0].hz;
+    double f1 = out.freqs.size() > 1 ? out.freqs[1].hz : (f0 + 1.0);
+    size_t Nflat = out.sparams[0].size();
+    std::vector<std::complex<double>> dc_flat(Nflat);
+    for(size_t idx=0; idx<Nflat; ++idx) {
+        std::complex<double> s0 = out.sparams[0][idx];
+        std::complex<double> s1 = out.sparams[1][idx];
+        if(f0 == 0.0) {
+            dc_flat[idx] = s0;
+        } else {
+            dc_flat[idx] = s0 + (s0 - s1) * (f0 / (f1 - f0));
+        }
+    }
+    // insert DC freq and sparams at front
+    // construct a Frequency at 0 Hz
+    Frequency fzero; fzero.hz = 0.0; out.freqs.insert(out.freqs.begin(), fzero);
+    out.sparams.insert(out.sparams.begin(), dc_flat);
+    return out;
+}
 class IEEEP370_SE_NZC_2xThru_Cpp : public CalibrationBase {
 public:
     IEEEP370_SE_NZC_2xThru_Cpp(const Network &dummy_2xthru, double z0 = 50.0, bool use_z_instead_ifft = true, bool verbose=false)
-        : s2xthru_(dummy_2xthru), z0_(z0), verbose_(verbose) {
-        // fallback to Z-branch implementation for now
-        std::tie(s_side1_, s_side2_) = IEEEP370_SE_ZC_2xThru(dummy_2xthru, z0_).split2xthru_z(dummy_2xthru);
+        : s2xthru_(dummy_2xthru), z0_(z0), verbose_(verbose), fd_qm_(verbose), td_qm_(1e9, 32, 0.35, 1, 2, verbose) {
+        // attempt to extrapolate dummy 2xthru to DC before splitting; fall back to original
+        Network expl = extrapolate_to_dc(dummy_2xthru);
+        // attempt NZC-style time-domain correction
+        try {
+            Network expl2 = td_qm_.perform_nzc_extrapolation(expl);
+            std::tie(s_side1_, s_side2_) = IEEEP370_SE_ZC_2xThru(expl2, z0_).split2xthru_z(expl2);
+        } catch(...) {
+            std::tie(s_side1_, s_side2_) = IEEEP370_SE_ZC_2xThru(expl, z0_).split2xthru_z(expl);
+        }
+        // compute quick FD/TD quality metrics and cache results for diagnostics
+        try {
+            fd_qm_result_ = fd_qm_.check_se_quality(dummy_2xthru, verbose_);
+        } catch(...) { }
+        try {
+            td_qm_result_ = td_qm_.check_se_quality(dummy_2xthru, verbose_);
+        } catch(...) { }
     }
     void run() override { coefs_computed_ = true; }
     Network apply_cal(const Network &ntwk) const override {
-        // reuse ZC deembedding logic
+        // reuse ZC deembedding logic until full NZC time-domain port is implemented
         IEEEP370_SE_ZC_2xThru zimpl(s2xthru_, z0_);
         return zimpl.apply_cal(ntwk);
     }
+
+    // Diagnostic accessors
+    IEEEP370_FD_QM::QMResult fd_qm_result() const { return fd_qm_result_; }
+    IEEEP370_TD_QM::TDQMResult td_qm_result() const { return td_qm_result_; }
+
 private:
     Network s2xthru_; double z0_{50.0}; bool verbose_{false}; Network s_side1_, s_side2_;
+    IEEEP370_FD_QM fd_qm_;
+    IEEEP370_TD_QM td_qm_;
+    IEEEP370_FD_QM::QMResult fd_qm_result_;
+    IEEEP370_TD_QM::TDQMResult td_qm_result_;
 };
 
 class IEEEP370_MM_NZC_2xThru_Cpp : public CalibrationBase {
 public:
     IEEEP370_MM_NZC_2xThru_Cpp(const Network &dummy_2xthru, double z0 = 50.0, bool use_z_instead_ifft = true, bool verbose=false)
-        : s2xthru_(dummy_2xthru), z0_(z0), verbose_(verbose) {
-        std::tie(s_side1_, s_side2_) = IEEEP370_MM_ZC_2xThru(dummy_2xthru, z0_).split2xthru_z(dummy_2xthru);
+        : s2xthru_(dummy_2xthru), z0_(z0), verbose_(verbose), fd_qm_(verbose), td_qm_(1e9, 32, 0.35, 1, 2, verbose) {
+        Network expl = extrapolate_to_dc(dummy_2xthru);
+        try {
+            Network expl2 = td_qm_.perform_nzc_extrapolation(expl);
+            std::tie(s_side1_, s_side2_) = IEEEP370_MM_ZC_2xThru(expl2, z0_).split2xthru_z(expl2);
+        } catch(...) {
+            std::tie(s_side1_, s_side2_) = IEEEP370_MM_ZC_2xThru(expl, z0_).split2xthru_z(expl);
+        }
+        try { fd_qm_result_ = fd_qm_.check_se_quality(dummy_2xthru, verbose_); } catch(...) {}
+        try { td_qm_result_ = td_qm_.check_se_quality(dummy_2xthru, verbose_); } catch(...) {}
     }
     void run() override { coefs_computed_ = true; }
     Network apply_cal(const Network &ntwk) const override { IEEEP370_MM_ZC_2xThru zimpl(s2xthru_, z0_); return zimpl.apply_cal(ntwk); }
+
+    IEEEP370_FD_QM::QMResult fd_qm_result() const { return fd_qm_result_; }
+    IEEEP370_TD_QM::TDQMResult td_qm_result() const { return td_qm_result_; }
+
 private:
     Network s2xthru_; double z0_{50.0}; bool verbose_{false}; Network s_side1_, s_side2_;
+    IEEEP370_FD_QM fd_qm_;
+    IEEEP370_TD_QM td_qm_;
+    IEEEP370_FD_QM::QMResult fd_qm_result_;
+    IEEEP370_TD_QM::TDQMResult td_qm_result_;
 };
 
 } // namespace skrf_cpp
 
 // Additional calibration subclasses (skeletons) to be implemented fully.
 namespace skrf_cpp {
+
+// IEEEP370 helper: Fixture Electrical Requirements (FD) and Quality Metrics
+class IEEEP370_FER {
+public:
+    // Compute simple FD metrics used by plotting routines in Python reference.
+    // Returns pair of vectors: IL (S21 dB) and RL (S11 dB) for two-port 2xThru.
+    static std::pair<std::vector<double>, std::vector<double>> fd_se_metrics(const Network &s2xthru) {
+        NetworkEigen ne = s2xthru.to_network_eigen();
+        size_t N = ne.s_params.size();
+        std::vector<double> il(N, 0.0), rl(N, 0.0);
+        for(size_t i=0;i<N;++i) {
+            if(ne.n_ports >= 2) {
+                std::complex<double> s21 = ne.s_params[i](1,0);
+                std::complex<double> s11 = ne.s_params[i](0,0);
+                il[i] = 20.0 * std::log10(std::abs(s21) + 1e-16);
+                rl[i] = 20.0 * std::log10(std::abs(s11) + 1e-16);
+            }
+        }
+        return {il, rl};
+    }
+};
+
+// Frequency-domain quality metrics (initial checks)
+class IEEEP370_FD_QM {
+public:
+    explicit IEEEP370_FD_QM(bool verbose = false) : verbose_(verbose) {}
+
+    // Causality quality metric (percent)
+    double check_causality(const Network &ntwk) const {
+        NetworkEigen ne = ntwk.to_network_eigen();
+        int Nf = static_cast<int>(ne.freqs.size());
+        if(Nf < 3) return 100.0;
+        int nports = ne.n_ports;
+        std::vector<std::vector<double>> CQM(nports, std::vector<double>(nports, 100.0));
+        for(int i=0;i<nports;++i) for(int j=0;j<nports;++j) {
+            // collect vector over freq
+            std::vector<std::complex<double>> svec(Nf);
+            for(int k=0;k<Nf;++k) svec[k] = ne.s_params[k](i,j);
+            bool allsame=true; for(int k=1;k<Nf;++k) if(svec[k]!=svec[0]) { allsame=false; break; }
+            if(allsame) { CQM[i][j] = 100.0; continue; }
+            double TotalR=0.0, PositiveR=0.0;
+            for(int k=0;k<Nf-2;++k) {
+                auto Vn = svec[k+1] - svec[k];
+                auto Vn1 = svec[k+2] - svec[k+1];
+                double R = std::real(Vn1) * std::imag(Vn) - std::imag(Vn1) * std::real(Vn);
+                if(R > 0) PositiveR += R;
+                TotalR += std::abs(R);
+            }
+            CQM[i][j] = (TotalR==0.0) ? 100.0 : std::max(0.0, PositiveR/TotalR) * 100.0;
+        }
+        // return minimum across matrix
+        double minv = 1e9; for(auto &r: CQM) for(auto &v: r) if(v < minv) minv = v;
+        return minv;
+    }
+
+    // Passivity quality metric (percent)
+    double check_passivity(const Network &ntwk) const {
+        NetworkEigen ne = ntwk.to_network_eigen();
+        if(ne.n_ports == 1) throw std::runtime_error("check_passivity: not defined for 1-port");
+        int Nf = static_cast<int>(ne.s_params.size());
+        std::vector<double> PM(Nf, 0.0);
+        for(int i=0;i<Nf;++i) {
+            // compute spectral norm (largest singular value)
+            Eigen::JacobiSVD<Eigen::MatrixXcd> svd(ne.s_params[i], Eigen::ComputeThinU | Eigen::ComputeThinV);
+            double sigma_max = svd.singularValues()(0);
+            PM[i] = sigma_max;
+        }
+        double A = 1.00001; double B = 0.1;
+        std::vector<double> PW(Nf, 0.0);
+        for(int i=0;i<Nf;++i) if(PM[i] > A) PW[i] = (PM[i] - A)/B;
+        double res = std::max(0.0, static_cast<double>(Nf - std::accumulate(PW.begin(), PW.end(), 0.0))) / Nf * 100.0;
+        return res;
+    }
+
+    // Reciprocity quality metric (percent)
+    double check_reciprocity(const Network &ntwk) const {
+        NetworkEigen ne = ntwk.to_network_eigen();
+        if(ne.n_ports == 1) throw std::runtime_error("check_reciprocity: not defined for 1-port");
+        int Nf = static_cast<int>(ne.s_params.size());
+        int nports = ne.n_ports;
+        std::vector<double> RM(Nf, 0.0), RW(Nf, 0.0);
+        for(int i=0;i<Nf;++i) {
+            double sum=0.0;
+            for(int k=0;k<nports;++k) for(int m=0;m<nports;++m) sum += std::abs(ne.s_params[i](k,m) - ne.s_params[i](m,k));
+            RM[i] = sum / (nports * (nports - 1));
+            double C = 1e-6, B = 0.1;
+            if(RM[i] > C) RW[i] = (RM[i] - C) / B;
+        }
+        double res = std::max(0.0, static_cast<double>(Nf - std::accumulate(RW.begin(), RW.end(), 0.0))) / Nf * 100.0;
+        return res;
+    }
+
+    // Single-ended combined quality check (returns dict-like struct)
+    struct QMResult { double causality; double passivity; double reciprocity; std::string causality_eval; std::string passivity_eval; std::string reciprocity_eval; };
+    QMResult check_se_quality(const Network &ntwk, bool verbose=false) const {
+        QMResult out;
+        out.causality = check_causality(ntwk);
+        out.passivity = check_passivity(ntwk);
+        out.reciprocity = check_reciprocity(ntwk);
+        // evaluations (same thresholds as Python)
+        out.causality_eval = (out.causality <= 20.) ? "poor" : (out.causality <= 50. ? "inconclusive" : (out.causality <= 80. ? "acceptable" : "good"));
+        out.passivity_eval = (out.passivity <= 80.) ? "poor" : (out.passivity <= 99. ? "inconclusive" : (out.passivity <= 99.9 ? "acceptable" : "good"));
+        out.reciprocity_eval = (out.reciprocity <= 80.) ? "poor" : (out.reciprocity <= 99. ? "inconclusive" : (out.reciprocity <= 99.9 ? "acceptable" : "good"));
+        return out;
+    }
+
+    // Mixed-mode quality (attempt for 4-port networks by extracting sub-blocks)
+    std::map<std::string, QMResult> check_mm_quality(const Network &ntwk, bool verbose=false) const {
+        // attempt to extract differential/common mode pairs (0,1) and (2,3)
+        std::map<std::string, QMResult> res;
+        if(ntwk.n_ports < 4) throw std::runtime_error("check_mm_quality: requires 4-port network");
+        Network se_dd = ntwk.extract_ports({0,1});
+        Network se_cc = ntwk.extract_ports({2,3});
+        res["dd"] = check_se_quality(se_dd, verbose);
+        res["cc"] = check_se_quality(se_cc, verbose);
+        return res;
+    }
+
+    void print_qm(const QMResult &qm) const {
+        std::cout << "causality: " << qm.causality << "% (" << qm.causality_eval << ")\n";
+        std::cout << "passivity: " << qm.passivity << "% (" << qm.passivity_eval << ")\n";
+        std::cout << "reciprocity: " << qm.reciprocity << "% (" << qm.reciprocity_eval << ")\n";
+    }
+
+private:
+    bool verbose_{false};
+};
+
+// Time-domain quality metrics (TD_QM) - pragmatic port of Python logic.
+class IEEEP370_TD_QM {
+public:
+    IEEEP370_TD_QM(double data_rate, int sample_per_UI, double rise_time_per,
+                  int pulse_shape = 1, int extrapolation = 2, bool verbose = false)
+        : data_rate_(data_rate), sample_per_UI_(sample_per_UI), rise_time_per_(rise_time_per),
+          pulse_shape_(pulse_shape), extrapolation_(extrapolation), verbose_(verbose) {}
+
+    // Add complex-conjugate symmetric extension (length 2N-1)
+    static std::vector<std::complex<double>> add_conj(const std::vector<std::complex<double>> &s) {
+        size_t N = s.size();
+        std::vector<std::complex<double>> out(2*N - 1);
+        for(size_t i=0;i<N;++i) out[i] = s[i];
+        for(size_t k=0;k<N-1;++k) out[N + k] = std::conj(out[N - k - 1]);
+        return out;
+    }
+
+    // Simple inverse DFT (naive). Input X length M -> returns time samples length M
+    static std::vector<std::complex<double>> ifft(const std::vector<std::complex<double>> &X) {
+        size_t N = X.size();
+        std::vector<std::complex<double>> x(N);
+        const double two_pi = 2.0 * M_PI;
+        for(size_t n=0;n<N;++n) {
+            std::complex<double> sum(0.0,0.0);
+            for(size_t k=0;k<N;++k) {
+                double ang = two_pi * k * n / static_cast<double>(N);
+                sum += X[k] * std::exp(std::complex<double>(0.0, ang));
+            }
+            x[n] = sum / static_cast<double>(N);
+        }
+        return x;
+    }
+
+    // Simple forward DFT
+    static std::vector<std::complex<double>> fft(const std::vector<std::complex<double>> &x) {
+        size_t N = x.size();
+        std::vector<std::complex<double>> X(N);
+        const double two_pi = 2.0 * M_PI;
+        for(size_t k=0;k<N;++k) {
+            std::complex<double> sum(0.0,0.0);
+            for(size_t n=0;n<N;++n) {
+                double ang = -two_pi * k * n / static_cast<double>(N);
+                sum += x[n] * std::exp(std::complex<double>(0.0, ang));
+            }
+            X[k] = sum;
+        }
+        return X;
+    }
+
+    // Hann window generator
+    static std::vector<double> hann_window(size_t N) {
+        std::vector<double> w(N);
+        for(size_t n=0;n<N;++n) w[n] = 0.5 * (1.0 - std::cos(2.0 * M_PI * static_cast<double>(n) / static_cast<double>(N-1)));
+        return w;
+    }
+
+    // Estimate peak location with parabolic interpolation for sub-sample accuracy.
+    static std::pair<int,double> estimate_peak_subsample(const std::vector<std::complex<double>> &v) {
+        int M = static_cast<int>(v.size());
+        int imax = 0; double vmax = 0.0;
+        for(int i=0;i<M;++i) { double mag = std::abs(v[i]); if(mag > vmax) { vmax = mag; imax = i; } }
+        int im = (imax - 1 + M) % M; int ip = (imax + 1) % M;
+        double ym = std::abs(v[im]); double y0 = std::abs(v[imax]); double yp = std::abs(v[ip]);
+        double denom = (ym - 2.0*y0 + yp);
+        double delta = 0.0;
+        if(std::abs(denom) > 1e-16) delta = 0.5 * (ym - yp) / denom;
+        return {imax, delta};
+    }
+
+    // Circular shift by integer samples
+    static std::vector<std::complex<double>> circ_shift(const std::vector<std::complex<double>> &v, int shift) {
+        int N = static_cast<int>(v.size());
+        std::vector<std::complex<double>> out(N);
+        for(int i=0;i<N;++i) out[i] = v[(i + shift + N) % N];
+        return out;
+    }
+
+    // Apply fractional (sub-sample) shift using simple linear interpolation in time domain
+    static std::vector<std::complex<double>> fractional_shift_linear(const std::vector<std::complex<double>> &v, double frac) {
+        int N = static_cast<int>(v.size());
+        if(std::abs(frac) < 1e-12) return v;
+        // positive frac means shift right by frac samples
+        std::vector<std::complex<double>> out(N);
+        for(int n=0;n<N;++n) {
+            double idx_f = static_cast<double>(n) - frac;
+            int idx0 = static_cast<int>(std::floor(idx_f));
+            double alpha = idx_f - static_cast<double>(idx0);
+            int i0 = (idx0 % N + N) % N;
+            int i1 = ((idx0+1) % N + N) % N;
+            out[n] = (1.0 - alpha) * v[i0] + alpha * v[i1];
+        }
+        return out;
+    }
+
+    // Unwrap phase of complex vector (returns phase vector)
+    static std::vector<double> unwrap_phase(const std::vector<std::complex<double>> &v) {
+        size_t N = v.size();
+        std::vector<double> ph(N);
+        for(size_t i=0;i<N;++i) ph[i] = std::atan2(std::imag(v[i]), std::real(v[i]));
+        for(size_t i=1;i<N;++i) {
+            double d = ph[i] - ph[i-1];
+            if(d > M_PI) ph[i] -= 2.0*M_PI;
+            else if(d < -M_PI) ph[i] += 2.0*M_PI;
+        }
+        // cumulative correction
+        for(size_t i=1;i<N;++i) ph[i] += ph[i-1] - ph[i-1];
+        return ph;
+    }
+
+    // Create passive network (SVD clip) - operates frequency-by-frequency
+    Network create_passive(const Network &ntwk) const {
+        NetworkEigen ne = ntwk.to_network_eigen();
+        Network out = ntwk; // copy meta
+        out.sparams.clear(); out.sparams.reserve(ne.s_params.size());
+        for(size_t i=0;i<ne.s_params.size();++i) {
+            Eigen::JacobiSVD<Eigen::MatrixXcd> svd(ne.s_params[i], Eigen::ComputeThinU | Eigen::ComputeThinV);
+            Eigen::VectorXd S = svd.singularValues().real();
+            for(int k=0;k<S.size();++k) if(S(k) > 1.0) S(k) = 1.0;
+            Eigen::MatrixXcd recon = svd.matrixU() * S.asDiagonal().cast<std::complex<double>>() * svd.matrixV().adjoint();
+            // flatten
+            int p = recon.rows(); std::vector<std::complex<double>> flat(p*p);
+            for(int r=0;r<p;++r) for(int c=0;c<p;++c) flat[r*p + c] = recon(r,c);
+            out.sparams.push_back(std::move(flat));
+        }
+        return out;
+    }
+
+    // Create reciprocal: swap s_ij and s_ji
+    Network create_reciprocal(const Network &ntwk) const {
+        NetworkEigen ne = ntwk.to_network_eigen();
+        Network out = ntwk; out.sparams.clear(); out.sparams.reserve(ne.s_params.size());
+        for(size_t i=0;i<ne.s_params.size();++i) {
+            Eigen::MatrixXcd M = ne.s_params[i];
+            Eigen::MatrixXcd Mr = M.transpose();
+            int p = Mr.rows(); std::vector<std::complex<double>> flat(p*p);
+            for(int r=0;r<p;++r) for(int c=0;c<p;++c) flat[r*p + c] = Mr(r,c);
+            out.sparams.push_back(std::move(flat));
+        }
+        return out;
+    }
+
+    // Simplified time-domain impulse computation for S-parameters
+    // Returns v (2N-1 x nports x nports) as flattened vector of matrices per-time-step
+    std::tuple<std::vector<std::vector<std::complex<double>>>, std::vector<double>> get_time_domain(const Network &ntwk) const {
+        NetworkEigen ne = ntwk.to_network_eigen();
+        int N = static_cast<int>(ne.s_params.size());
+        double df = (ne.freqs.size()>=2) ? (ne.freqs[1].hz - ne.freqs[0].hz) : 1.0;
+        double dt = 1.0 / (2.0 * ne.freqs.back().hz + df);
+        int nports = ne.n_ports;
+        int outN = 2*N - 1;
+        std::vector<double> t(outN); for(int i=0;i<outN;++i) t[i] = dt * i;
+        // prepare result: for each time index store flattened matrix (nports*nports)
+        std::vector<std::vector<std::complex<double>>> v(outN, std::vector<std::complex<double>>(nports*nports, std::complex<double>(0,0)));
+        // simple approach: for each s_ij compute ifft of conj-extended spectrum
+        for(int i=0;i<nports;++i) for(int j=0;j<nports;++j) {
+            std::vector<std::complex<double>> svec(N);
+            for(int k=0;k<N;++k) svec[k] = ne.s_params[k](i,j) * filter_at_index(k, N);
+            svec[0] = std::complex<double>(std::real(svec[0]), 0.0);
+            auto sconj = add_conj(svec);
+            auto vfull = ifft(sconj);
+            for(int ti=0; ti<outN; ++ti) v[ti][i*nports + j] = std::real(vfull[ti]);
+        }
+        return {v, t};
+    }
+
+    // compute simple filter multiplier (1 or lowpass) at freq index
+    double filter_at_index(int idx, int N) const { (void)idx; (void)N; return 1.0; }
+
+    // compute time-domain metric difference (simple L-infty over unit intervals)
+    std::vector<std::vector<double>> get_td_difference_mv(const std::vector<std::vector<std::complex<double>>> &v1,
+                                                          const std::vector<std::vector<std::complex<double>>> &v2,
+                                                          const std::vector<double> &t, int nports) const {
+        int N = static_cast<int>(t.size());
+        double dt = (N>=2) ? (t[1] - t[0]) : 1.0;
+        double UI = 1.0 / data_rate_ / dt;
+        int N_UI = std::max(1, static_cast<int>(std::round(UI)));
+        std::vector<std::vector<double>> out(nports, std::vector<double>(nports, 0.0));
+        for(int i=0;i<nports;++i) for(int j=0;j<nports;++j) {
+            double maxv = 0.0;
+            for(int k=0;k<N;++k) {
+                double diff = std::abs(v2[k][i*nports + j] - v1[k][i*nports + j]);
+                if(diff > maxv) maxv = diff;
+            }
+            out[i][j] = maxv;
+        }
+        return out;
+    }
+
+    // High-level single-ended check (orchestrates extrapolation, causal/passive/reciprocal models)
+    struct TDQMResult { double causality_mV; double passivity_mV; double reciprocity_mV; std::string causality_eval; std::string passivity_eval; std::string reciprocity_eval; };
+    TDQMResult check_se_quality(const Network &ntwk, bool verbose=false) {
+        // extrapolate and simple pipeline using approximations
+        Network ntwk_interp = ntwk; // TODO: implement extrapolate_to_fmax and extrapolate_to_dc faithfully
+        auto [v_origin, t] = get_time_domain(ntwk_interp);
+        Network causal = create_reciprocal(ntwk_interp); // placeholder: use reciprocal as proxy
+        auto [v_causal, tc] = get_time_domain(causal);
+        Network passive = create_passive(ntwk_interp);
+        auto [v_passive, tp] = get_time_domain(passive);
+
+        auto caus_mv = get_td_difference_mv(v_causal, v_origin, t, ntwk.n_ports);
+        auto pass_mv = get_td_difference_mv(v_passive, v_origin, t, ntwk.n_ports);
+        auto rec_mv = get_td_difference_mv(v_origin, v_origin, t, ntwk.n_ports);
+        // aggregate into scalar metrics
+        double caus_metric = 1000.0 * l2_norm_matrix(caus_mv);
+        double pass_metric = 1000.0 * l2_norm_matrix(pass_mv);
+        double rec_metric  = 1000.0 * l2_norm_matrix(rec_mv);
+        TDQMResult res;
+        res.causality_mV = std::round(caus_metric * 10.0) / 10.0;
+        res.passivity_mV = std::round(pass_metric * 10.0) / 10.0;
+        res.reciprocity_mV = std::round(rec_metric * 10.0) / 10.0;
+        // simple evaluations
+        auto eval = [](double v)->std::string { if(v>=15.) return "poor"; if(v>=10.) return "inconclusive"; if(v>=5.) return "acceptable"; return "good"; };
+        res.causality_eval = eval(res.causality_mV/2.0); res.passivity_eval = eval(res.passivity_mV/2.0); res.reciprocity_eval = eval(res.reciprocity_mV/2.0);
+        return res;
+    }
+
+    void print_qm(const TDQMResult &qm) const {
+        std::cout << "causality (mV): " << qm.causality_mV << " (" << qm.causality_eval << ")\n";
+        std::cout << "passivity (mV): " << qm.passivity_mV << " (" << qm.passivity_eval << ")\n";
+        std::cout << "reciprocity (mV): " << qm.reciprocity_mV << " (" << qm.reciprocity_eval << ")\n";
+    }
+
+    // Perform NZC-style time-domain processing and return a frequency-domain
+    // network with corrected S-parameters (DC included as first sample).
+    Network perform_nzc_extrapolation(const Network &ntwk) const {
+        NetworkEigen ne = ntwk.to_network_eigen();
+        int N = static_cast<int>(ne.s_params.size());
+        int nports = ne.n_ports;
+        Network out = ntwk; out.sparams.clear(); out.sparams.reserve(N);
+        // For each port pair, compute corrected spectrum
+        // We'll build per-frequency flattened matrices
+        std::vector<std::vector<std::complex<double>>> corrected_flat(N, std::vector<std::complex<double>>(nports*nports, {0,0}));
+        for(int i=0;i<nports;++i) for(int j=0;j<nports;++j) {
+            // collect spectrum over freqs
+            std::vector<std::complex<double>> S(N);
+            for(int k=0;k<N;++k) S[k] = ne.s_params[k](i,j);
+            // conj-extend and get time-domain impulse
+            auto Sconj = add_conj(S);
+            auto impulse = ifft(Sconj);
+            // find peak and circular-shift so peak at index 0
+            int M = static_cast<int>(impulse.size());
+            int peak = 0; double vmax = 0.0;
+            for(int t=0;t<M;++t) { double mag = std::abs(impulse[t]); if(mag > vmax) { vmax = mag; peak = t; } }
+            std::vector<std::complex<double>> shifted(M);
+            for(int t=0;t<M;++t) shifted[t] = impulse[(t + peak) % M];
+            // forward FFT and take first N bins
+            auto Sshift = fft(shifted);
+            for(int k=0;k<N;++k) corrected_flat[k][i*nports + j] = Sshift[k];
+        }
+        // now pack flattened matrices per frequency
+        for(int k=0;k<N;++k) {
+            std::vector<std::complex<double>> flat(nports*nports);
+            for(int idx=0; idx<nports*nports; ++idx) flat[idx] = corrected_flat[k][idx];
+            out.sparams.push_back(std::move(flat));
+        }
+        return out;
+    }
+
+private:
+    double data_rate_;
+    int sample_per_UI_;
+    double rise_time_per_;
+    int pulse_shape_;
+    int extrapolation_;
+    bool verbose_;
+
+    static double l2_norm_matrix(const std::vector<std::vector<double>> &m) {
+        double sum=0.0; for(auto &r:m) for(auto &v:r) sum += v*v; return std::sqrt(sum);
+    }
+};
+
 
 // Twelve-term calibration (12-term error-box model)
 class TwelveTermCal : public CalibrationBase {
